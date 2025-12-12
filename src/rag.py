@@ -1,28 +1,31 @@
-# main code for retrieval-augmented generation (RAG) functionality
-
+# src/rag.py
+import os
 import json
-from pathlib import Path
-from typing import List, Dict, Any
 import numpy as np
+from typing import Dict, Any, List
+from pathlib import Path
 
-from sentence_transformers import SentenceTransformer
-import faiss
+# vector_index import (the fallback we've added earlier)
+from vector_index import VectorIndex  # optional, used if embeddings.npy is present
 
-# Lazy-loaded embedding model
+# TF-IDF fallback imports
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# SentenceTransformers attempt
 _EMBED_MODEL = None
+_EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 
-def get_embed_model(name: str = "all-MiniLM-L6-v2"):
-    global _EMBED_MODEL
-    if _EMBED_MODEL is None:
-        _EMBED_MODEL = SentenceTransformer(name)
-    return _EMBED_MODEL
+THIS_DIR = Path(__file__).resolve().parent
+DATA_DIR = THIS_DIR.parent / "data"
+EMB_PATH = DATA_DIR / "embeddings.npy"
+META_PATH = DATA_DIR / "meta.jsonl"
 
-def load_meta(meta_path: str = "data/meta.jsonl") -> List[Dict[str, Any]]:
-    p = Path(meta_path)
-    if not p.exists():
-        raise FileNotFoundError(f"Meta file not found: {meta_path}")
+def _load_meta() -> List[Dict[str, Any]]:
     metas = []
-    with p.open("r", encoding="utf-8") as fh:
+    if not META_PATH.exists():
+        return metas
+    with open(META_PATH, "r", encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line:
@@ -30,146 +33,157 @@ def load_meta(meta_path: str = "data/meta.jsonl") -> List[Dict[str, Any]]:
             metas.append(json.loads(line))
     return metas
 
-def load_faiss(index_path: str = "data/faiss.index"):
-    p = Path(index_path)
-    if not p.exists():
-        raise FileNotFoundError(f"FAISS index not found: {index_path}")
-    idx = faiss.read_index(str(p))
-    return idx
+# Try to load SentenceTransformers model (CPU). If it fails, we'll use TF-IDF fallback.
+def get_sentence_transformer():
+    global _EMBED_MODEL
+    if _EMBED_MODEL is not None:
+        return _EMBED_MODEL
+    try:
+        from sentence_transformers import SentenceTransformer
+        # force CPU device to reduce likelihood of meta-tensor device ops:
+        _EMBED_MODEL = SentenceTransformer(_EMBED_MODEL_NAME, device="cpu")
+        return _EMBED_MODEL
+    except Exception as e:
+        # fail silently and allow TF-IDF fallback
+        print("Warning: SentenceTransformer failed to load, falling back to TF-IDF. Error:", e)
+        _EMBED_MODEL = None
+        return None
 
-def embed_query(query: str, model_name: str = "all-MiniLM-L6-v2") -> np.ndarray:
-    model = get_embed_model(model_name)
-    emb = model.encode([query], show_progress_bar=False, normalize_embeddings=True)
-    return np.array(emb, dtype="float32")
+# Build TF-IDF vectorizer from meta chunks (cached)
+_TFIDF = None
+_TFIDF_MATRIX = None
+_METAS_CACHE = None
 
-def _normalize_scores(D: np.ndarray) -> np.ndarray:
+def build_tfidf_from_meta():
+    global _TFIDF, _TFIDF_MATRIX, _METAS_CACHE
+    if _TFIDF is not None and _TFIDF_MATRIX is not None:
+        return _TFIDF, _TFIDF_MATRIX, _METAS_CACHE
+    metas = _load_meta()
+    texts = [m.get("text", "") for m in metas]
+    if not texts:
+        return None, None, metas
+    vect = TfidfVectorizer(stop_words="english", max_features=20000)
+    mat = vect.fit_transform(texts)  # shape (n_chunks, n_features)
+    _TFIDF = vect
+    _TFIDF_MATRIX = mat
+    _METAS_CACHE = metas
+    return _TFIDF, _TFIDF_MATRIX, metas
+
+def embed_query_with_fallback(query: str):
     """
-    Convert FAISS returned D values into similarity scores in range roughly [-1,1] where bigger = better.
-    If D looks like distances (large positive values), convert via sim = 1 - D (assumes D was 1 - cos).
-    If D looks like inner-product / cosine similarities (in [-1,1]), return as-is.
+    Returns a (1, D) numpy array embedding for the query. 
+    Tries SentenceTransformer; if fails, uses TF-IDF vector (sparse -> dense).
     """
-    if D.size == 0:
-        return D
-    d_min = float(np.min(D))
-    d_max = float(np.max(D))
-    # Heuristic: if all values are within [-1.1, 1.1], treat as similarity (inner product / cosine)
-    if d_min >= -1.1 and d_max <= 1.1:
-        return D
-    # Otherwise treat as distance-like (bigger is worse). Convert to similarity:
-    # This is a heuristic: map sim = 1 - D (so smaller distance -> higher sim).
-    # Clamp output to reasonable bounds.
-    sims = 1.0 - D
-    return sims
+    model = get_sentence_transformer()
+    if model is not None:
+        # try to encode with SentenceTransformer
+        try:
+            emb = model.encode(query, convert_to_numpy=True)
+            if emb is not None:
+                return np.asarray(emb, dtype="float32"), "sbert"
+        except Exception as e:
+            print("Warning: SentenceTransformer encoding failed, falling back to TF-IDF. Error:", e)
+            # fall through to TF-IDF fallback
 
-def retrieve(question: str, k: int = 5, model_name: str = "all-MiniLM-L6-v2",
-             meta_path: str = "data/meta.jsonl", index_path: str = "data/faiss.index",
-             similarity_threshold: float = 0.20) -> List[Dict[str, Any]]:
+    # TF-IDF fallback
+    tfidf, mat, metas = build_tfidf_from_meta()
+    if tfidf is None or mat is None:
+        raise RuntimeError("No embedding model available and TF-IDF could not be built (meta missing).")
+    qvec = tfidf.transform([query])  # sparse matrix (1, features)
+    # convert to dense numpy array
+    qdense = qvec.toarray().astype("float32")
+    return qdense, "tfidf"
+
+def retrieve_with_fallback(query: str, k: int = 5, similarity_threshold: float = None):
     """
-    Retrieve top-k relevant chunks and filter by similarity threshold.
-    Returns a list of meta dicts (with added '_score' and '_index_pos').
+    Main retrieval worker. Tries to use precomputed embeddings + VectorIndex if available,
+    else uses embed_query_with_fallback + cosine similarity against meta texts (TF-IDF path).
+    Returns list of retrieved dicts with keys: page, chunk_id, text, _score
     """
-    metas = load_meta(meta_path)
-    idx = load_faiss(index_path)
+    # If embeddings.npy and VectorIndex is present, prefer vector-based search with VectorIndex
+    if EMB_PATH.exists() and META_PATH.exists():
+        try:
+            # try to load vector index (this will use faiss if available or sklearn fallback)
+            import numpy as np
+            embs = np.load(EMB_PATH)
+            idx = VectorIndex(embs.astype("float32"))
+            # use sbert if available for embedding, else tfidf
+            q_emb, backend = embed_query_with_fallback(query)
+            ids, dists = idx.search(q_emb, k=k)
+            # normalize distances -> score (smaller distance better). For FAISS L2 lower is better; for sklearn we returned distances
+            retrieved = []
+            metas = _load_meta()
+            for i, dist in zip(ids, dists):
+                if i < 0 or i >= len(metas):
+                    continue
+                retrieved.append({
+                    "page": metas[i].get("page"),
+                    "chunk_id": metas[i].get("chunk_id"),
+                    "text": metas[i].get("text"),
+                    "_score": float(dist)
+                })
+            return retrieved
+        except Exception as e:
+            # fallback to TF-IDF path if any error
+            print("Warning: VectorIndex path failed, falling back to TF-IDF retrieval. Error:", e)
 
-    q_emb = embed_query(question, model_name)  # shape (1, d)
-    D, I = idx.search(q_emb, k)  # D shape (1,k), I shape (1,k)
-    D = np.array(D, dtype=float)
-    I = np.array(I, dtype=int)
+    # TF-IDF retrieval
+    qvec, backend = embed_query_with_fallback(query)  # will return dense (1, D) for tfidf or sbert
+    if backend == "tfidf":
+        # use cosine similarity between qvec (dense) and TF-IDF matrix (sparse)
+        tfidf, mat, metas = build_tfidf_from_meta()
+        # mat is sparse (n_chunks, features)
+        from sklearn.metrics.pairwise import cosine_similarity
+        sims = cosine_similarity(qvec, mat)  # shape (1, n_chunks)
+        sims = sims.flatten()
+        # get top k indices by similarity
+        topk_idx = sims.argsort()[::-1][:k]
+        retrieved = []
+        for idx in topk_idx:
+            retrieved.append({
+                "page": metas[idx].get("page"),
+                "chunk_id": metas[idx].get("chunk_id"),
+                "text": metas[idx].get("text"),
+                "_score": float(sims[idx])
+            })
+        return retrieved
+    else:
+        # if backend == sbert but we couldn't use VectorIndex, fall back to scoring against meta texts by encoding all meta texts
+        metas = _load_meta()
+        texts = [m.get("text", "") for m in metas]
+        try:
+            # encode texts (may be heavy, but meta is limited in size)
+            from sentence_transformers import SentenceTransformer
+            model = SentenceTransformer(_EMBED_MODEL_NAME, device="cpu")
+            txt_embs = model.encode(texts, convert_to_numpy=True)
+            from sklearn.metrics.pairwise import cosine_similarity
+            sims = cosine_similarity(qvec, txt_embs).flatten()
+            topk_idx = sims.argsort()[::-1][:k]
+            retrieved = []
+            for idx in topk_idx:
+                retrieved.append({
+                    "page": metas[idx].get("page"),
+                    "chunk_id": metas[idx].get("chunk_id"),
+                    "text": metas[idx].get("text"),
+                    "_score": float(sims[idx])
+                })
+            return retrieved
+        except Exception as e:
+            # last-resort: simple substring match ranking
+            retrieved = []
+            for m in metas[:k]:
+                retrieved.append({"page": m.get("page"), "chunk_id": m.get("chunk_id"), "text": m.get("text"), "_score": 0.0})
+            return retrieved
 
-    # Convert returned D to similarity scores (bigger = better)
-    sims = _normalize_scores(D[0])  # 1-D array length k
-
-    retrieved = []
-    for rank, idx_pos in enumerate(I[0].tolist()):
-        if idx_pos < 0 or idx_pos >= len(metas):
-            continue
-        sim_score = float(sims[rank])
-        # Filter by threshold
-        if sim_score < similarity_threshold:
-            # skip low-sim matches
-            continue
-        m = metas[idx_pos].copy()
-        m["_score"] = sim_score
-        m["_index_pos"] = int(idx_pos)
-        retrieved.append(m)
-
-    return retrieved
-
-def build_prompt(retrieved: List[Dict[str, Any]], question: str, max_ctx_chars: int = 3000) -> str:
-    """
-    Build a grounded prompt. If no retrieved contexts, return a short prompt that instructs model to say "I don't know."
-    This prompt instructs the LLM to:
-      1) Begin with a single, direct sentence that answers the question (numbers first if applicable).
-      2) Then give a short justification (1-3 sentences).
-      3) End with a 'Sources:' line listing page numbers.
-    """
-    if not retrieved:
-        return (
-            "You are an assistant that must answer using ONLY the provided document excerpts.\n"
-            "No relevant excerpts were found for the user's question. Therefore, reply exactly: I don't know.\n\n"
-            f"QUESTION:\n{question}\n\nAnswer:"
-        )
-
-    instruction = (
-        "You are an assistant that must answer using ONLY the provided document excerpts.\n"
-        "INSTRUCTIONS:\n"
-        "1) **Start your response with one short direct sentence that answers the question.** If the answer includes numeric projections, put the numbers first (for example: 'Real GDP growth is projected to improve to 2 percent in 2024–25.').\n"
-        "2) Then provide a brief justification in 1-3 sentences using only the content shown in Context.\n"
-        "3) Finish with a 'Sources:' line listing the page numbers cited (e.g., 'Sources: page 2').\n"
-        "If the answer is not present in the excerpts, reply exactly: I don't know.\n\n"
-    )
-
-    ctxs = []
-    used_chars = 0
+def build_prompt_from_chunks(question: str, retrieved: List[Dict[str, Any]]):
+    prompt = "You are an assistant that must answer using ONLY the provided document excerpts.\nIf the answer is not present, say 'I don't know'.\n\n"
+    prompt += f"QUESTION: {question}\n\nEVIDENCE:\n"
     for r in retrieved:
-        txt = (r.get("text") or "").strip()
-        if not txt:
-            continue
-        entry = f"[page {r.get('page')}] {txt}"
-        entry_len = len(entry)
-        if used_chars + entry_len > max_ctx_chars and used_chars > 0:
-            break
-        ctxs.append(entry)
-        used_chars += entry_len
-
-    context_block = "\n\n".join(ctxs)
-    prompt = f"{instruction}Context:\n{context_block}\n\nQUESTION:\n{question}\n\nAnswer:"
+        prompt += f"[page {r.get('page')}] {r.get('text')}\n\n"
+    prompt += "\nAnswer:"
     return prompt
 
-    instruction = (
-        "You are an assistant that must answer using ONLY the provided document excerpts.\n"
-        "If the answer is not present in the excerpts, reply exactly: I don't know.\n"
-        "Answer concisely and cite page numbers in the 'Sources:' section at the end.\n\n"
-    )
-
-    ctxs = []
-    used_chars = 0
-    for r in retrieved:
-        txt = (r.get("text") or "").strip()
-        if not txt:
-            continue
-        entry = f"[page {r.get('page')}] {txt}"
-        entry_len = len(entry)
-        if used_chars + entry_len > max_ctx_chars and used_chars > 0:
-            break
-        ctxs.append(entry)
-        used_chars += entry_len
-
-    context_block = "\n\n".join(ctxs)
-    prompt = f"{instruction}Context:\n{context_block}\n\nQUESTION:\n{question}\n\nAnswer:"
-    return prompt
-
-def retrieve_and_prepare(question: str, k: int = 5, **kwargs) -> Dict[str, Any]:
-    """
-    High-level helper used by the app.
-    Returns:
-      {
-        "retrieved": [ ... ],
-        "prompt": "<string>",
-      }
-    """
-    # allow caller to override similarity_threshold via kwargs if needed
-    similarity_threshold = kwargs.pop("similarity_threshold", 0.20)
-    retrieved = retrieve(question, k=k, similarity_threshold=similarity_threshold, **kwargs)
-    prompt = build_prompt(retrieved, question)
+def retrieve_and_prepare(question: str, k: int = 5, similarity_threshold: float = None):
+    retrieved = retrieve_with_fallback(question, k=k, similarity_threshold=similarity_threshold)
+    prompt = build_prompt_from_chunks(question, retrieved)
     return {"retrieved": retrieved, "prompt": prompt}
